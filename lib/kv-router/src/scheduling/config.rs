@@ -4,6 +4,7 @@
 use std::env::{self, VarError};
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use derive_builder::Builder;
 use rand::Rng;
@@ -34,6 +35,48 @@ pub fn min_initial_workers_from_env() -> anyhow::Result<usize> {
     }
 }
 
+const fn default_host_cache_hit_weight() -> f64 {
+    0.75
+}
+
+const fn default_disk_cache_hit_weight() -> f64 {
+    0.25
+}
+
+/// Type of external shared KV cache to query during routing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharedCacheType {
+    /// No shared cache (default).
+    #[default]
+    None,
+    /// HiCache L3 shared cache — queries sglang workers via the request plane.
+    Hicache,
+}
+
+impl fmt::Display for SharedCacheType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::Hicache => f.write_str("hicache"),
+        }
+    }
+}
+
+impl FromStr for SharedCacheType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "hicache" => Ok(Self::Hicache),
+            _ => Err(format!(
+                "unknown shared_cache_type: {s:?}, expected 'none' or 'hicache'"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouterQueuePolicy {
@@ -50,6 +93,43 @@ impl fmt::Display for RouterQueuePolicy {
             Self::Lcfs => f.write_str("lcfs"),
             Self::Wspt => f.write_str("wspt"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouterPrefillLoadModel {
+    #[default]
+    None,
+    Aic,
+}
+
+impl fmt::Display for RouterPrefillLoadModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::Aic => f.write_str("aic"),
+        }
+    }
+}
+
+impl FromStr for RouterPrefillLoadModel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "aic" => Ok(Self::Aic),
+            _ => Err(format!(
+                "unknown prefill load model: {s:?}, expected 'none' or 'aic'"
+            )),
+        }
+    }
+}
+
+impl RouterPrefillLoadModel {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -83,6 +163,11 @@ pub struct RouterConfigOverride {
 
     #[builder(default)]
     pub track_prefill_tokens: Option<bool>,
+
+    /// Per-request override of `shared_cache_multiplier`.
+    #[builder(default)]
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub shared_cache_multiplier: Option<f64>,
 }
 
 /// KV Router configuration parameters
@@ -92,6 +177,14 @@ pub struct RouterConfigOverride {
 pub struct KvRouterConfig {
     #[validate(range(min = 0.0))]
     pub overlap_score_weight: f64,
+
+    #[serde(default = "default_host_cache_hit_weight")]
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub host_cache_hit_weight: f64,
+
+    #[serde(default = "default_disk_cache_hit_weight")]
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub disk_cache_hit_weight: f64,
 
     #[validate(range(min = 0.0))]
     pub router_temperature: f64,
@@ -124,6 +217,9 @@ pub struct KvRouterConfig {
     #[serde(default = "default_track_prefill_tokens")]
     pub router_track_prefill_tokens: bool,
 
+    /// Optional model for estimating effective prompt-side prefill load over time.
+    pub router_prefill_load_model: RouterPrefillLoadModel,
+
     /// Threshold for triggering snapshots. If None, no snapshots will be performed.
     #[validate(range(min = 1))]
     pub router_snapshot_threshold: Option<u32>,
@@ -135,18 +231,10 @@ pub struct KvRouterConfig {
     #[validate(range(min = 0.0))]
     pub router_ttl_secs: f64,
 
-    /// Maximum tree size before pruning (only used when use_kv_events is false, default: 2^20 = 1048576)
-    #[validate(range(min = 1))]
-    pub router_max_tree_size: usize,
-
-    /// Target size ratio after pruning (only used when use_kv_events is false, default: 0.8)
-    #[validate(range(min = 0.0, max = 1.0))]
-    pub router_prune_target_ratio: f64,
-
     /// Queue threshold fraction for prefill token capacity.
     /// When set, requests are queued if all workers exceed this fraction of max_num_batched_tokens.
     /// If None, queueing is disabled and all requests go directly to ready.
-    /// Default: 2.0. Must be > 0.
+    /// Default: 4.0. Must be >= 0. Use 0.0 for maximum queueing sensitivity.
     #[validate(range(min = 0.0))]
     pub router_queue_threshold: Option<f64>,
 
@@ -156,12 +244,6 @@ pub struct KvRouterConfig {
     #[validate(range(min = 1))]
     pub router_event_threads: u32,
 
-    /// Enable cache control (PIN with TTL) via the worker's cache_control service mesh endpoint.
-    /// When true, the router creates a cache_control client and honors nvext.cache_control on
-    /// requests, firing a pin_prefix call (with TTL) to the worker after generation completes.
-    /// When false (default), cache_control is ignored and no cache_control client is created.
-    pub router_enable_cache_control: bool,
-
     pub skip_initial_worker_wait: bool,
 
     /// Scheduling policy for the router queue.
@@ -169,18 +251,34 @@ pub struct KvRouterConfig {
     /// "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.
     pub router_queue_policy: RouterQueuePolicy,
 
-    /// Component name of a standalone KV indexer to use for overlap scoring.
-    /// When set, the router creates a `Remote` indexer that queries the standalone
-    /// indexer via the request plane instead of maintaining a local radix tree.
-    /// The standalone indexer handles its own event subscription and discovery.
+    /// Whether to query a remote KV indexer served from the worker component
+    /// instead of maintaining a local radix tree for overlap scoring.
     #[serde(default)]
-    pub remote_indexer_component: Option<String>,
+    pub use_remote_indexer: bool,
+
+    /// Whether this router should serve its local indexer from the worker component.
+    #[serde(default)]
+    pub serve_indexer: bool,
+
+    /// Multiplier for shared cache hits when scoring workers (0.0 to 1.0).
+    /// Blocks available in the shared cache are less valuable than device-local blocks
+    /// because they need to be fetched. A value of 0.5 means each shared cache hit
+    /// counts as half a device-local hit. Default: 0.0 (shared cache scoring disabled);
+    /// the CLI sets this to 0.5 when shared cache is enabled.
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub shared_cache_multiplier: f64,
+
+    /// Type of external shared KV cache to query during routing.
+    /// "none" (default): disabled. "hicache": query sglang workers for L3 cache state.
+    pub shared_cache_type: SharedCacheType,
 }
 
 impl Default for KvRouterConfig {
     fn default() -> Self {
         Self {
             overlap_score_weight: 1.0,
+            host_cache_hit_weight: default_host_cache_hit_weight(),
+            disk_cache_hit_weight: default_disk_cache_hit_weight(),
             router_temperature: 0.0,
             use_kv_events: true,
             durable_kv_events: false, // default to NATS Core (local indexer mode)
@@ -189,17 +287,18 @@ impl Default for KvRouterConfig {
             router_track_output_blocks: false,
             router_assume_kv_reuse: true,
             router_track_prefill_tokens: default_track_prefill_tokens(),
+            router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_snapshot_threshold: Some(1000000),
             router_reset_states: false,
             router_ttl_secs: 120.0,
-            router_max_tree_size: 2usize.pow(20), // 2^20 = 1048576, matches PruneConfig::default()
-            router_prune_target_ratio: 0.8,
             router_queue_threshold: Some(4.0),
             router_event_threads: 4,
-            router_enable_cache_control: false,
             skip_initial_worker_wait: false,
             router_queue_policy: RouterQueuePolicy::default(),
-            remote_indexer_component: None,
+            use_remote_indexer: false,
+            serve_indexer: false,
+            shared_cache_multiplier: 0.0,
+            shared_cache_type: SharedCacheType::default(),
         }
     }
 }
@@ -221,10 +320,43 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), ValidationEr
             "router_track_output_blocks requires router_track_active_blocks=true",
         ));
     }
+    if config.router_prefill_load_model.is_enabled() && !config.router_track_prefill_tokens {
+        return Err(ValidationError::new(
+            "router_prefill_load_model requires router_track_prefill_tokens=true",
+        ));
+    }
+    if config.router_prefill_load_model.is_enabled()
+        && !matches!(config.router_queue_policy, RouterQueuePolicy::Fcfs)
+    {
+        return Err(ValidationError::new(
+            "router_prefill_load_model currently requires router_queue_policy='fcfs'",
+        ));
+    }
+    if config.use_remote_indexer && config.serve_indexer {
+        return Err(ValidationError::new(
+            "use_remote_indexer and serve_indexer are mutually exclusive",
+        ));
+    }
+    if config.serve_indexer && config.overlap_score_weight == 0.0 {
+        return Err(ValidationError::new(
+            "serve_indexer requires overlap_score_weight > 0",
+        ));
+    }
     Ok(())
 }
 
 impl KvRouterConfig {
+    pub fn router_queue_recheck_interval(&self) -> Duration {
+        const DEFAULT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+        const PREFILL_LOAD_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+        if self.router_prefill_load_model.is_enabled() && self.router_queue_threshold.is_some() {
+            return PREFILL_LOAD_RECHECK_INTERVAL;
+        }
+
+        DEFAULT_RECHECK_INTERVAL
+    }
+
     pub fn assume_kv_reuse(&self, config_override: Option<&RouterConfigOverride>) -> bool {
         config_override
             .and_then(|cfg| cfg.assume_kv_reuse)
@@ -296,28 +428,6 @@ mod tests {
     use crate::protocols::{BlockExtraInfo, BlockMmObjectInfo};
 
     #[test]
-    fn router_queue_policy_display_and_parse_support_lcfs() {
-        assert_eq!(RouterQueuePolicy::Lcfs.to_string(), "lcfs");
-        assert_eq!(
-            "lcfs".parse::<RouterQueuePolicy>().unwrap(),
-            RouterQueuePolicy::Lcfs
-        );
-    }
-
-    #[test]
-    fn router_queue_policy_serde_round_trip_supports_lcfs() {
-        let serialized = serde_json::to_string(&RouterQueuePolicy::Lcfs).unwrap();
-        assert_eq!(serialized, "\"lcfs\"");
-        let deserialized: RouterQueuePolicy = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, RouterQueuePolicy::Lcfs);
-    }
-
-    #[test]
-    fn kv_router_config_defaults_to_tracking_prefill_tokens() {
-        assert!(KvRouterConfig::default().router_track_prefill_tokens);
-    }
-
-    #[test]
     fn compute_seq_hashes_for_tracking_uses_mm_hashes() {
         let cfg = KvRouterConfig::default();
         let tokens = vec![1, 2, 3, 4];
@@ -351,17 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn router_config_override_serde_round_trip_preserves_track_prefill_tokens() {
-        let serialized = serde_json::to_string(&RouterConfigOverride {
-            track_prefill_tokens: Some(false),
-            ..Default::default()
-        })
-        .unwrap();
-        let deserialized: RouterConfigOverride = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.track_prefill_tokens, Some(false));
-    }
-
-    #[test]
     fn compute_seq_hashes_for_tracking_uses_precomputed_block_hashes() {
         let config = KvRouterConfig::default();
         let tokens: Vec<u32> = (0..8).collect();
@@ -376,5 +475,46 @@ mod tests {
         );
 
         assert_eq!(seq_hashes, Some(compute_seq_hash_for_block(&precomputed)));
+    }
+
+    #[test]
+    fn test_kv_router_config_rejects_out_of_range_shared_cache_multiplier() {
+        let too_small = KvRouterConfig {
+            shared_cache_multiplier: -0.1,
+            ..Default::default()
+        };
+        let too_large = KvRouterConfig {
+            shared_cache_multiplier: 1.1,
+            ..Default::default()
+        };
+
+        assert!(too_small.validate().is_err());
+        assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn test_router_config_override_rejects_out_of_range_shared_cache_multiplier() {
+        let too_small = RouterConfigOverride {
+            overlap_score_weight: None,
+            router_temperature: None,
+            assume_kv_reuse: None,
+            track_prefill_tokens: None,
+            shared_cache_multiplier: Some(-0.1),
+        };
+        let too_large = RouterConfigOverride {
+            overlap_score_weight: None,
+            router_temperature: None,
+            assume_kv_reuse: None,
+            track_prefill_tokens: None,
+            shared_cache_multiplier: Some(1.1),
+        };
+
+        assert!(too_small.validate().is_err());
+        assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn test_kv_router_config_default_shared_cache_multiplier_is_disabled() {
+        assert_eq!(KvRouterConfig::default().shared_cache_multiplier, 0.0);
     }
 }

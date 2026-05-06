@@ -25,7 +25,7 @@ from aiconfigurator.sdk.picking import pick_autoscale, pick_default, pick_load_m
 from aiconfigurator.sdk.task import TaskConfig
 
 from deploy.utils.dynamo_deployment import DynamoDeploymentClient
-from dynamo.planner.defaults import SubComponentType
+from dynamo.planner.config.defaults import SubComponentType
 from dynamo.profiler.rapid import _generate_dgd_from_pick
 from dynamo.profiler.utils.aic_dataframe import (
     build_decode_row,
@@ -356,6 +356,7 @@ async def run_thorough(
         isl=isl,
         osl=osl,
         num_gpus_per_node=dgdr.hardware.numGpusPerNode,
+        total_gpus=total_gpus,
         k8s_pvc_name=model_cache.pvcName,
         k8s_pvc_mount_path=model_cache.pvcMountPath,
         k8s_model_path_in_pvc=model_cache.pvcModelPath,

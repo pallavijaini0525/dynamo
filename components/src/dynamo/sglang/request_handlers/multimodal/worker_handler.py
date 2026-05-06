@@ -14,6 +14,7 @@ from dynamo.common.constants import DisaggregationMode, EmbeddingTransferMode
 from dynamo.common.multimodal import EMBEDDING_RECEIVER_FACTORIES, TransferRequest
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
+from dynamo.common.utils.otel_tracing import build_trace_headers
 from dynamo.sglang.args import Config
 from dynamo.sglang.protocol import (
     DisaggSglangMultimodalRequest,
@@ -62,6 +63,8 @@ class SglangUtils:
             sampling_params["top_p"] = sampling_options.top_p
         if sampling_options.top_k is not None:
             sampling_params["top_k"] = sampling_options.top_k
+        if sampling_options.n is not None:
+            sampling_params["n"] = sampling_options.n
         if stop_conditions.max_tokens:
             sampling_params["max_new_tokens"] = stop_conditions.max_tokens
         if stop_conditions.ignore_eos:
@@ -158,12 +161,16 @@ class StreamProcessor:
 
                     output = {
                         "token_ids": output_ids,
+                        # Preserve SGLang's choice index for n>1 multimodal
+                        # streams; older/non-n chunks are choice 0.
+                        "index": res.get("index") or 0,
                         "text": res.get("text", ""),
                         "finished": False,
                     }
 
-                    # Check for finish reason
                     if finish_reason:
+                        # For n > 1, choices can finish independently and SGLang
+                        # may continue emitting chunks for other choice indices.
                         output.update(
                             {
                                 "finish_reason": normalize_finish_reason(
@@ -172,8 +179,6 @@ class StreamProcessor:
                                 "finished": True,
                             }
                         )
-                        yield json.dumps(output)
-                        break
 
                     yield json.dumps(output)
 
@@ -328,7 +333,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 rng_disagg = _nvtx.start_range("mm:pd:generate_disagg", color="red")
                 try:
                     async for output in self._generate_disaggregated(
-                        request, _end_ttft
+                        request, _end_ttft, context=context
                     ):
                         yield output
                 finally:
@@ -336,7 +341,9 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             else:
                 rng_agg = _nvtx.start_range("mm:pd:generate_agg", color="red")
                 try:
-                    async for output in self._generate_aggregated(request, _end_ttft):
+                    async for output in self._generate_aggregated(
+                        request, _end_ttft, context=context
+                    ):
                         yield output
                 finally:
                     _nvtx.end_range(rng_agg)
@@ -352,6 +359,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
         self,
         request: SglangMultimodalRequest,
         end_ttft: Callable[[], None],
+        context=None,
     ) -> AsyncIterator[str]:
         """Handle disaggregated mode generation"""
         input_ids = request.request.token_ids
@@ -362,7 +370,11 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
 
         # Request bootstrap info from prefill worker
         bootstrap_info = await self._get_bootstrap_from_prefill(
-            request, sampling_params
+            request, sampling_params, context=context
+        )
+
+        trace_header = (
+            build_trace_headers(context) if context and self.enable_trace else None
         )
 
         # Start decode generation with bootstrap info (no image data needed)
@@ -373,6 +385,8 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             bootstrap_host=bootstrap_info["bootstrap_host"],
             bootstrap_port=bootstrap_info["bootstrap_port"],
             bootstrap_room=bootstrap_info["bootstrap_room"],
+            external_trace_header=trace_header,
+            rid=context.trace_id if context else None,
         )
 
         rng_first = _nvtx.start_range("mm:dec:first_token", color="purple")
@@ -393,6 +407,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
         self,
         request: SglangMultimodalRequest,
         end_ttft: Callable[[], None],
+        context=None,
     ) -> AsyncIterator[str]:
         """Handle aggregated mode generation"""
         input_ids = request.request.token_ids
@@ -412,11 +427,17 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             )
             logger.debug(f"Input token sequence length: {len(input_ids)}")
 
+            trace_header = (
+                build_trace_headers(context) if context and self.enable_trace else None
+            )
+
             agg_stream = await self.engine.async_generate(
                 input_ids=input_ids,
                 image_data=mm_items,
                 sampling_params=sampling_params,
                 stream=True,
+                external_trace_header=trace_header,
+                rid=context.trace_id if context else None,
             )
 
             rng_first = _nvtx.start_range("mm:dec:first_token", color="purple")
@@ -459,7 +480,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 self.embeddings_processor.release_embeddings(tensor_id)
 
     async def _get_bootstrap_from_prefill(
-        self, request: SglangMultimodalRequest, sampling_params: dict
+        self, request: SglangMultimodalRequest, sampling_params: dict, context=None
     ) -> dict:
         """Get bootstrap info from prefill worker"""
         assert self.prefill_client is not None
@@ -467,7 +488,8 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             DisaggSglangMultimodalRequest(
                 request=request,
                 sampling_params=sampling_params,
-            ).model_dump_json()
+            ).model_dump_json(),
+            context=context,
         )
 
         bootstrap_info = None
@@ -554,7 +576,9 @@ class MultimodalPrefillWorkerHandler(
             yield json.dumps(bootstrap_info)
 
             # Process prefill generation
-            await self._process_prefill_generation(disagg_request, bootstrap_room)
+            await self._process_prefill_generation(
+                disagg_request, bootstrap_room, context=context
+            )
 
         except Exception as e:
             logger.error(f"Error in prefill generation: {e}", exc_info=True)
@@ -581,7 +605,10 @@ class MultimodalPrefillWorkerHandler(
         return disagg_request
 
     async def _process_prefill_generation(
-        self, disagg_request: DisaggSglangMultimodalRequest, bootstrap_room: int
+        self,
+        disagg_request: DisaggSglangMultimodalRequest,
+        bootstrap_room: int,
+        context=None,
     ):
         """Process multimodal input and start prefill generation"""
         # Get the SglangMultimodalRequest from the DisaggSglangMultimodalRequest
@@ -596,6 +623,10 @@ class MultimodalPrefillWorkerHandler(
                 request, self.embeddings_processor
             )
 
+        trace_header = (
+            build_trace_headers(context) if context and self.enable_trace else None
+        )
+
         # Start SGLang prefill generation (like regular SGLang)
         with _nvtx.annotate("mm:prefill:engine_async_generate", color="blue"):
             results = await self.engine.async_generate(
@@ -606,6 +637,8 @@ class MultimodalPrefillWorkerHandler(
                 bootstrap_host=self.bootstrap_host,
                 bootstrap_port=self.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                external_trace_header=trace_header,
+                rid=context.trace_id if context else None,
             )
 
         # Consume results without yielding (prefill doesn't return text, just coordinates)
