@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use dynamo_kv_router::protocols::*;
+use dynamo_kv_router::services::indexer::mamba_checkpoints::mamba_checkpoint_cap_enabled;
 use dynamo_kv_router::zmq_wire::*;
 
 use crate::kv_router::metrics::kv_publisher_metrics;
@@ -44,6 +45,19 @@ pub(super) fn decode_zmq_kv_batch(
     })
 }
 
+/// Worker-side normalizer: forwards Mamba checkpoints only when the router cap is enabled.
+pub(super) fn worker_normalizer(
+    kv_block_size: u32,
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+    forward_mamba: bool,
+) -> ZmqEventNormalizer {
+    ZmqEventNormalizer::new(kv_block_size)
+        .with_image_token_id(image_token_id)
+        .with_video_token_id(video_token_id)
+        .with_mamba_forwarding(forward_mamba)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn start_zmq_listener(
     zmq_endpoint: String,
@@ -62,9 +76,12 @@ pub(super) async fn start_zmq_listener(
         zmq_topic
     );
 
-    let mut normalizer = ZmqEventNormalizer::new(kv_block_size)
-        .with_image_token_id(image_token_id)
-        .with_video_token_id(video_token_id);
+    let mut normalizer = worker_normalizer(
+        kv_block_size,
+        image_token_id,
+        video_token_id,
+        mamba_checkpoint_cap_enabled(),
+    );
     let socket = match connect_sub_socket(&zmq_endpoint, Some(&zmq_topic)).await {
         Ok(socket) => socket,
         Err(error) => {

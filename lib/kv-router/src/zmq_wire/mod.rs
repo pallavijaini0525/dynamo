@@ -55,6 +55,7 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    forward_mamba: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            forward_mamba: false,
         }
     }
 
@@ -120,6 +122,7 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            forward_mamba: false,
         }
     }
 
@@ -128,6 +131,13 @@ impl ZmqEventNormalizer {
     /// models (leave unset).
     pub fn with_image_token_id(mut self, image_token_id: Option<u32>) -> Self {
         self.image_token_id = image_token_id;
+        self
+    }
+
+    /// Forward Mamba cache-group events (tagged `CacheGroup::Mamba`) instead of
+    /// filtering them. Off by default.
+    pub fn with_mamba_forwarding(mut self, forward_mamba: bool) -> Self {
+        self.forward_mamba = forward_mamba;
         self
     }
 
@@ -207,8 +217,47 @@ impl ZmqEventNormalizer {
         if let Some(reason) = self.filter_reason(metadata, worker.dp_rank) {
             return Err(reason);
         }
+        if self.tag_forwarded_group(&mut raw, metadata, worker.dp_rank) {
+            // A checkpoint hash equals the attention hash at the same boundary but has no
+            // namespace of its own; it must not touch the attention namespace chain.
+            return Ok(raw);
+        }
         self.propagate_cache_namespace(&mut raw, worker)?;
         Ok(raw)
+    }
+
+    /// When the event belongs to a forwarded non-attention group, make sure its
+    /// `kv_cache_spec_kind` is set (a `BlockRemoved` only carries `group_idx`) and
+    /// return true.
+    fn tag_forwarded_group(
+        &self,
+        raw: &mut RawKvEvent,
+        metadata: KvCacheEventMetadata,
+        dp_rank: DpRank,
+    ) -> bool {
+        let kind = metadata.kv_cache_spec_kind.or_else(|| {
+            metadata.group_idx.and_then(|group_idx| {
+                self.group_metadata
+                    .get(&(dp_rank, group_idx))
+                    .map(|group| group.kind)
+            })
+        });
+        let Some(kind) = kind.filter(|kind| self.forward_mamba && kind.cache_group().is_some())
+        else {
+            return false;
+        };
+        match raw {
+            RawKvEvent::BlockStored {
+                kv_cache_spec_kind, ..
+            }
+            | RawKvEvent::BlockRemoved {
+                kv_cache_spec_kind, ..
+            } => {
+                *kv_cache_spec_kind = Some(kind);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn normalize_preprocessed(
@@ -365,6 +414,9 @@ impl ZmqEventNormalizer {
             if kind == KvCacheSpecKind::Unknown {
                 return Some(ZmqEventFilterReason::UnknownKind);
             }
+            if self.forward_mamba && kind.cache_group().is_some() {
+                return None;
+            }
             return Some(ZmqEventFilterReason::NonMainAttentionKind);
         }
 
@@ -377,6 +429,9 @@ impl ZmqEventNormalizer {
             }
             if metadata.kind == KvCacheSpecKind::Unknown {
                 return Some(ZmqEventFilterReason::UnknownKind);
+            }
+            if self.forward_mamba && metadata.kind.cache_group().is_some() {
+                return None;
             }
             return Some(ZmqEventFilterReason::NonMainAttentionGroup);
         }

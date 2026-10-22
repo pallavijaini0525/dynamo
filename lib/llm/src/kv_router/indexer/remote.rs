@@ -599,6 +599,7 @@ mod tests {
             approx: Some(SideIndexer::KvIndexer(side)),
             primary_records_routing_decisions: false,
             session_updates: None,
+            mamba_checkpoints: None,
         };
 
         assert_eq!(
@@ -652,6 +653,7 @@ mod tests {
             approx: None,
             primary_records_routing_decisions: false,
             session_updates: None,
+            mamba_checkpoints: None,
         };
 
         // Worker owns [11, 12] on device and [11, 12, 13] on host-pinned.
@@ -754,6 +756,7 @@ mod tests {
             approx: None,
             primary_records_routing_decisions: false,
             session_updates: None,
+            mamba_checkpoints: None,
         };
 
         indexer

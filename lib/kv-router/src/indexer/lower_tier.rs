@@ -1746,6 +1746,7 @@ mod tests {
 
         index
             .apply_event(RouterEvent {
+                cache_group: None,
                 worker_id: 7,
                 state_source: None,
                 session_id: None,
